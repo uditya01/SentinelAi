@@ -1,0 +1,222 @@
+"""
+scanner/threat_checker.py
+
+Two-layer threat detection:
+  Layer 1 — instant local SQLite lookup (offline)
+  Layer 2 — VirusTotal API (online, only if not found locally)
+
+Usage
+-----
+    from scanner.threat_checker import ThreatChecker
+
+    checker = ThreatChecker(vt_api_key="your_key_here")
+    threat = checker.check("sha256hexstring...")
+
+    if threat.is_threat:
+        print(threat.label())
+"""
+
+from hashlib import sha256
+import os
+import sys
+import json
+import time
+import urllib.request
+import urllib.error
+from typing import Optional
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from database.db import HashDatabase
+from scanner.models import ThreatInfo, CLEAN, THREAT, SUSPICIOUS, UNKNOWN
+
+# VirusTotal free tier: 4 requests per minute
+VT_API_URL        = "https://www.virustotal.com/api/v3/files/{}"
+VT_RATE_LIMIT     = 4       # requests per minute
+VT_MIN_INTERVAL   = 60 / VT_RATE_LIMIT   # 15 seconds between calls
+
+# If >= this many VT engines flag it → THREAT
+# If >= 2 but less than threshold → SUSPICIOUS  
+VT_THREAT_THRESHOLD = 5
+
+
+class ThreatChecker:
+    """
+    Checks a SHA-256 hash through two layers:
+    1. Local SQLite database (fast, offline)
+    2. VirusTotal API       (online, rate-limited)
+
+    Parameters
+    ----------
+    vt_api_key : str or None
+        Your VirusTotal API key. If None, Layer 2 is skipped.
+    db_path : str or None
+        Path to the SQLite database. Uses default if None.
+    use_virustotal : bool
+        Set False to disable VT lookups entirely (offline mode).
+    """
+
+    def __init__(
+        self,
+        vt_api_key: Optional[str] = None,
+        db_path: Optional[str] = None,
+        use_virustotal: bool = True,
+    ):
+        self.vt_api_key = vt_api_key or os.environ.get("VT_API_KEY", "")
+        self.use_virustotal = use_virustotal and bool(self.vt_api_key)
+        self._last_vt_call = 0.0
+
+        kwargs = {"db_path": db_path} if db_path else {}
+        self.db = HashDatabase(**kwargs)
+        self.db.setup()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def check(self, sha256: str) -> ThreatInfo:
+        """
+        Run both layers and return a ThreatInfo verdict.
+        Always returns something — never raises.
+        """
+        if not sha256:
+            return ThreatInfo(verdict=UNKNOWN, source="")
+
+        sha256 = sha256.lower()
+
+        # Layer 1: local DB
+        result = self.check_local(sha256)
+        if result is not None:
+            return result
+
+        # Layer 2: VirusTotal
+        if self.use_virustotal:
+            result = self._check_virustotal(sha256)
+            if result is not None:
+                return result
+
+        return ThreatInfo(verdict=CLEAN, source="")
+
+    def add_to_local_db(self, sha256: str, malware_name: str = "", source: str = "manual"):
+        """Manually add a hash to the local database."""
+        self.db.insert_many([{
+            "sha256": sha256,
+            "malware_name": malware_name,
+            "source": source,
+        }])
+
+    # ── Layer 1: Local DB ─────────────────────────────────────────────────────
+
+    def check_local(self, sha256: str) -> Optional[ThreatInfo]:
+        try:
+            sha256 = sha256.lower()
+            row = self.db.lookup(sha256)
+
+            print("=" * 60)
+            print("LOCAL DATABASE CHECK")
+            print(f"SHA256: {sha256}")
+            print(f"Lookup Result: {row}")
+            print("=" * 60)
+
+            # No match
+            if row is None:
+                return None
+
+            # Match found
+            print("✓ LOCAL DATABASE MATCH FOUND!")
+
+            return ThreatInfo(
+                verdict="THREAT",
+                source="local_db",
+                malware_name=row.get("malware_name", "Malware"),
+                detection_count=1,
+                total_engines=1,
+            )
+
+        except Exception as e:
+            print(f"[threat_checker] Local DB error: {e}")
+            return None
+
+    # ── Layer 2: VirusTotal ───────────────────────────────────────────────────
+
+    def _check_virustotal(self, sha256: str) -> Optional[ThreatInfo]:
+        
+        self._wait_for_rate_limit()
+
+        url = VT_API_URL.format(sha256)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "x-apikey": self.vt_api_key,
+                "Accept": "application/json",
+            }
+        )
+
+        try:
+
+            print("\n🌐 Checking VirusTotal...")
+            print("SHA256:", sha256)
+
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+
+            print("✓ VirusTotal response received")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # VT doesn't know this hash — treat as clean
+                return ThreatInfo(verdict=CLEAN, source="virustotal")
+            print(f"[threat_checker] VT HTTP error {e.code}: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"[threat_checker] VT request failed: {e}")
+            return None
+        finally:
+            self._last_vt_call = time.time()
+
+        return self._parse_vt_response(data)
+
+    def _parse_vt_response(self, data: dict) -> ThreatInfo:
+        try:
+            stats = data["data"]["attributes"]["last_analysis_stats"]
+            results = data["data"]["attributes"].get("last_analysis_results", {})
+
+            malicious   = stats.get("malicious", 0)
+            suspicious  = stats.get("suspicious", 0)
+            total       = sum(stats.values())
+            flagged     = malicious + suspicious
+            print(f"VirusTotal detections: {flagged}/{total}")
+
+            # Get the most common malware name from engine results
+            names = [
+                v.get("result", "")
+                for v in results.values()
+                if v.get("category") in ("malicious", "suspicious") and v.get("result")
+            ]
+            malware_name = _most_common(names) or "Unknown Malware"
+
+            if malicious >= VT_THREAT_THRESHOLD:
+                verdict = THREAT
+            elif flagged >= 2:
+                verdict = SUSPICIOUS
+            else:
+                verdict = CLEAN
+            print("Verdict:", verdict)
+            return ThreatInfo(
+                verdict=verdict,
+                source="virustotal",
+                malware_name=malware_name if verdict != CLEAN else "",
+                detection_count=flagged,
+                total_engines=total,
+            )
+
+        except (KeyError, TypeError) as e:
+            print(f"[threat_checker] VT parse error: {e}")
+            return ThreatInfo(verdict=UNKNOWN, source="virustotal")
+
+    def _wait_for_rate_limit(self):
+        elapsed = time.time() - self._last_vt_call
+        if elapsed < VT_MIN_INTERVAL:
+            time.sleep(VT_MIN_INTERVAL - elapsed)
+
+
+def _most_common(lst: list[str]) -> str:
+    if not lst:
+        return ""
+    return max(set(lst), key=lst.count)

@@ -1,0 +1,101 @@
+"""
+scanner/scanner.py
+
+Main scan orchestrator. Now includes threat checking after each hash.
+"""
+
+import os
+from typing import Callable, Optional
+
+from .hash_utils import compute_sha256
+from .models import FileResult, ScanResult, ThreatInfo, UNKNOWN
+from .threat_checker import ThreatChecker
+
+
+def run_scan(
+    directories: list[str],
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    on_threat: Optional[Callable[[FileResult], None]] = None,
+    abort_flag: Optional[Callable[[], bool]] = None,
+    checker: Optional[ThreatChecker] = None,
+) -> ScanResult:
+    """
+    Scan every file inside the supplied directories.
+
+    Parameters
+    ----------
+    directories
+        List of directories to scan.
+    on_progress(current, total, path)
+        Callback invoked after each file is processed.
+    on_threat(FileResult)
+        Callback invoked immediately when a threat is found.
+        Use this to update the UI threat list in real time.
+    abort_flag()
+        Callback returning True when the scan should stop.
+    checker
+        ThreatChecker instance. If None, threat checking is skipped.
+    """
+
+    # ── Collect all files ─────────────────────────────────────────────────────
+    all_files = []
+    for directory in directories:
+        if not os.path.isdir(directory):
+            continue
+        for root, _, filenames in os.walk(directory):
+            for filename in filenames:
+                all_files.append(os.path.join(root, filename))
+
+    result = ScanResult(
+        target_dirs=directories,
+        total_files=len(all_files),
+    )
+
+    for index, file_path in enumerate(all_files, start=1):
+
+        if abort_flag and abort_flag():
+            result.aborted = True
+            break
+
+        # Get size
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            size = 0
+
+        # Hash
+        sha256, error = compute_sha256(file_path)
+
+        # Threat check
+        threat: Optional[ThreatInfo] = None
+        if sha256 and checker:
+            threat = checker.check(sha256)
+        elif sha256:
+            threat = ThreatInfo(verdict=UNKNOWN)
+
+        file_result = FileResult(
+            path=file_path,
+            sha256=sha256,
+            size_bytes=size,
+            error=error,
+            threat=threat,
+        )
+
+        result.files.append(file_result)
+
+        if file_result.ok:
+            result.scanned_files += 1
+            result.total_bytes += size
+        else:
+            result.skipped_files += 1
+
+        # Count and surface threats immediately
+        if file_result.is_threat:
+            result.threats_found += 1
+            if on_threat:
+                on_threat(file_result)
+
+        if on_progress:
+            on_progress(index, result.total_files, file_path)
+
+    return result

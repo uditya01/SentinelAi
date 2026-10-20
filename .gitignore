@@ -1,0 +1,71 @@
+
+# ==============================
+# Python virtual environments
+# ==============================
+venv/
+.venv/
+env/
+
+# ==============================
+# Python cache and compiled files
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==============================
+# Secrets and API keys
+# ==============================
+.env
+.env.*
+!.env.example
+secrets.*
+*secret*
+*credentials*
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+.pytest_cache/
+.temp/
+tmp/
+
+# ==============================
+# IDE and operating system files
+# ==============================
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# EMBER dataset and archives
+# ==============================
+ai/dataset/ember_dataset_2018_2/
+ai/dataset/ember_dataset_2018_2.tar.bz2
+
+# ==============================
+# Large trained model files
+# Keep models out of Git unless intentionally distributed
+# ==============================
+ai/model.pkl
+ai/models/model.pkl
+*.joblib
+
+# ==============================
+# Local databases and quarantine
+# ==============================
+quarantine/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ==============================
+# Build and packaging artifacts
+# ==============================
+build/
+dist/
+*.spec
