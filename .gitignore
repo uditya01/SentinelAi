@@ -69,3 +69,5 @@ quarantine/
 build/
 dist/
 *.spec
+
+ai/models/ember_model_2018.txt
